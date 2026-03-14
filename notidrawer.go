@@ -1,0 +1,986 @@
+package notidrawer
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/divaxi/noti-drawer/internal/filesystems"
+	"github.com/divaxi/noti-drawer/notify"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+// Config is the top (or beginning) of the Caddy configuration structure.
+// Caddy config is expressed natively as a JSON document. If you prefer
+// not to work with JSON directly, there are [many config adapters](/docs/config-adapters)
+// available that can convert various inputs into Caddy JSON.
+//
+// Many parts of this config are extensible through the use of Caddy modules.
+// Fields which have a json.RawMessage type and which appear as dots (•••) in
+// the online docs can be fulfilled by modules in a certain module
+// namespace. The docs show which modules can be used in a given place.
+//
+// Whenever a module is used, its name must be given either inline as part of
+// the module, or as the key to the module's value. The docs will make it clear
+// which to use.
+//
+// Generally, all config settings are optional, as it is Caddy convention to
+// have good, documented default values. If a parameter is required, the docs
+// should say so.
+//
+// Go programs which are directly building a Config struct value should take
+// care to populate the JSON-encodable fields of the struct (i.e. the fields
+// with `json` struct tags) if employing the module lifecycle (e.g. Provision
+// method calls).
+
+const (
+	rawConfigKey = "config"
+	idKey        = "@id"
+)
+
+var pidfile string
+
+type Config struct {
+	Logging *Logging `json:"logging,omitempty"`
+
+	// StorageRaw is a storage module that defines how/where Caddy
+	// stores assets (such as TLS certificates). The default storage
+	// module is `caddy.storage.file_system` (the local file system),
+	// and the default path
+	// [depends on the OS and environment](/docs/conventions#data-directory).
+	StorageRaw json.RawMessage `json:"storage,omitempty" caddy:"namespace=caddy.storage inline_key=module"`
+
+	// AppsRaw are the apps that Caddy will load and run. The
+	// app module name is the key, and the app's config is the
+	// associated value.
+	AppsRaw ModuleMap `json:"apps,omitempty" caddy:"namespace="`
+
+	apps map[string]App
+
+	// failedApps is a map of apps that failed to provision with their underlying error.
+	failedApps   map[string]error
+	eventEmitter eventEmitter
+
+	cancelFunc context.CancelFunc
+
+	storage Storage
+
+	// fileSystems is a dict of fileSystems that will later be loaded from and added to.
+	fileSystems FileSystems
+}
+
+// App is a thing that Caddy runs.
+type App interface {
+	Start() error
+	Stop() error
+}
+
+// Run runs the given config, replacing any existing config.
+func Run(cfg *Config) error {
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return Load(cfgJSON)
+}
+
+// Load loads the given config JSON and runs it only
+// if it is different from the current config or
+// forceReload is true.
+func Load(cfgJSON []byte) error {
+	if err := notify.Reloading(); err != nil {
+		Log().Error("unable to notify service manager of reloading state", zap.Error(err))
+	}
+
+	// after reload, notify system of success or, if
+	// failure, update with status (error message)
+	var err error
+	defer func() {
+		if err != nil {
+			if notifyErr := notify.Error(err, 0); notifyErr != nil {
+				Log().Error("unable to notify to service manager of reload error",
+					zap.Error(notifyErr),
+					zap.String("reload_err", err.Error()))
+			}
+			return
+		}
+		if err := notify.Ready(); err != nil {
+			Log().Error("unable to notify to service manager of ready state", zap.Error(err))
+		}
+	}()
+
+	// Need to implement the load config and Run apps here
+
+	if errors.Is(err, errSameConfig) {
+		err = nil // not really an error
+	}
+
+	return err
+}
+
+// readConfig traverses the current config to path
+// and writes its JSON encoding to out.
+func readConfig(path string, out io.Writer) error {
+	rawCfgMu.RLock()
+	defer rawCfgMu.RUnlock()
+	return nil
+}
+
+// run runs newCfg and starts all its apps if
+// start is true. If any errors happen, cleanup
+// is performed if any modules were provisioned;
+// apps that were started already will be stopped,
+// so this function should not leak resources if
+// an error is returned. However, if no error is
+// returned and start == false, you should cancel
+// the config if you are not going to start it,
+// so that each provisioned module will be
+// cleaned up.
+//
+// This is a low-level function; most callers
+// will want to use Run instead, which also
+// updates the config's raw state.
+func run(newCfg *Config, start bool) (Context, error) {
+	ctx, err := provisionContext(newCfg)
+	if err != nil {
+		globalMetrics.configSuccess.Set(0)
+		return ctx, err
+	}
+
+	if !start {
+		return ctx, nil
+	}
+
+	defer func() {
+		// if newCfg fails to start completely, clean up the already provisioned modules
+		// partially copied from provisionContext
+		if err != nil {
+			globalMetrics.configSuccess.Set(0)
+			ctx.cfg.cancelFunc()
+
+			if currentCtx.cfg != nil {
+				// certmagic.Default.Storage = currentCtx.cfg.storage
+			}
+		}
+	}()
+
+	// Start
+	err = func() error {
+		started := make([]string, 0, len(ctx.cfg.apps))
+		for name, a := range ctx.cfg.apps {
+			err := a.Start()
+			if err != nil {
+				// an app failed to start, so we need to stop
+				// all other apps that were already started
+				for _, otherAppName := range started {
+					err2 := ctx.cfg.apps[otherAppName].Stop()
+					if err2 != nil {
+						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
+							err, otherAppName, err2)
+					}
+				}
+				return fmt.Errorf("%s app module: start: %v", name, err)
+			}
+			started = append(started, name)
+		}
+		return nil
+	}()
+	if err != nil {
+		return ctx, err
+	}
+	globalMetrics.configSuccess.Set(1)
+	globalMetrics.configSuccessTime.SetToCurrentTime()
+
+	// TODO: This event is experimental and subject to change.
+	ctx.emitEvent("started", nil)
+
+	// now that the user's config is running, finish setting up anything else,
+	// such as remote admin endpoint, config loader, etc.
+	err = finishSettingUp(ctx, ctx.cfg)
+	return ctx, err
+}
+
+// provisionContext creates a new context from the given configuration and provisions
+// storage and apps.
+// If `newCfg` is nil a new empty configuration will be created.
+// If `replaceAdminServer` is true any currently active admin server will be replaced
+// with a new admin server based on the provided configuration.
+func provisionContext(newCfg *Config) (Context, error) {
+	// because we will need to roll back any state
+	// modifications if this function errors, we
+	// keep a single error value and scope all
+	// sub-operations to their own functions to
+	// ensure this error value does not get
+	// overridden or missed when it should have
+	// been set by a short assignment
+	var err error
+
+	if newCfg == nil {
+		newCfg = new(Config)
+	}
+
+	// create a context within which to load
+	// modules - essentially our new config's
+	// execution environment; be sure that
+	// cleanup occurs when we return if there
+	// was an error; if no error, it will get
+	// cleaned up on next config cycle
+	ctx, cancel := NewContext(Context{Context: context.Background(), cfg: newCfg})
+	defer func() {
+		if err != nil {
+			globalMetrics.configSuccess.Set(0)
+			// if there were any errors during startup,
+			// we should cancel the new context we created
+			// since the associated config won't be used;
+			// this will cause all modules that were newly
+			// provisioned to clean themselves up
+			cancel()
+
+			// also undo any other state changes we made
+			if currentCtx.cfg != nil {
+
+			}
+		}
+	}()
+	newCfg.cancelFunc = cancel // clean up later
+
+	// set up logging before anything bad happens
+	if newCfg.Logging == nil {
+		newCfg.Logging = new(Logging)
+	}
+	err = newCfg.Logging.openLogs(ctx)
+	if err != nil {
+		return ctx, err
+	}
+
+	// create the new filesystem map
+	newCfg.fileSystems = &filesystems.FileSystemMap{}
+
+	// prepare the new config for use
+	newCfg.apps = make(map[string]App)
+	newCfg.failedApps = make(map[string]error)
+
+	// set up global storage and make it CertMagic's default storage, too
+	err = func() error {
+		if newCfg.StorageRaw != nil {
+			val, err := ctx.LoadModule(newCfg, "StorageRaw")
+			if err != nil {
+				return fmt.Errorf("loading storage module: %v", err)
+			}
+			stor, err := val.(StorageConverter).DiskStorage()
+			if err != nil {
+				return fmt.Errorf("creating storage value: %v", err)
+			}
+			newCfg.storage = stor
+		}
+
+		if newCfg.storage == nil {
+			newCfg.storage = DefaultStorage
+		}
+		// certmagic.Default.Storage = newCfg.storage
+
+		return nil
+	}()
+	if err != nil {
+		return ctx, err
+	}
+
+	// Load and Provision each app and their submodules
+	err = func() error {
+		for appName := range newCfg.AppsRaw {
+			if _, err := ctx.App(appName); err != nil {
+				return err
+			}
+		}
+		return nil
+	}()
+	return ctx, err
+}
+
+// finishSettingUp should be run after all apps have successfully started.
+func finishSettingUp(ctx Context, cfg *Config) error {
+	// establish this server's identity (only after apps are loaded
+	// so that cert management of this endpoint doesn't prevent user's
+	// servers from starting which likely also use HTTP/HTTPS ports;
+	// but before remote management which may depend on these creds)
+
+	// if dynamic config is requested, set that up and run it
+	if cfg != nil {
+		val, err := ctx.LoadModule(cfg, "LoadRaw")
+		if err != nil {
+			return fmt.Errorf("loading config loader module: %s", err)
+		}
+
+		logger := Log().Named("config_loader").With(
+			zap.String("module", val.(Module).NotidrawerModule().ID.Name()),
+		)
+		runLoadedConfig := func(config []byte) error {
+			logger.Info("applying dynamically-loaded config")
+			if err != nil {
+				logger.Error("failed to run dynamically-loaded config", zap.Error(err))
+				return err
+			}
+			logger.Info("successfully applied dynamically-loaded config")
+			return nil
+		}
+
+		// if no LoadDelay is provided, will load config synchronously
+		loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
+		if err != nil {
+			return fmt.Errorf("loading dynamic config from %T: %v", val, err)
+		}
+		// do this in a goroutine so current config can finish being loaded; otherwise deadlock
+		go func() { _ = runLoadedConfig(loadedConfig) }()
+	}
+	return nil
+}
+
+// ConfigLoader is a type that can load a Caddy config. If
+// the return value is non-nil, it must be valid Caddy JSON;
+// if nil or with non-nil error, it is considered to be a
+// no-op load and may be retried later.
+type ConfigLoader interface {
+	LoadConfig(Context) ([]byte, error)
+}
+
+// Stop stops running the current configuration.
+// It is the antithesis of Run(). This function
+// will log any errors that occur during the
+// stopping of individual apps and continue to
+// stop the others. Stop should only be called
+// if not replacing with a new config.
+func Stop() error {
+	currentCtxMu.RLock()
+	ctx := currentCtx
+	currentCtxMu.RUnlock()
+
+	rawCfgMu.Lock()
+	unsyncedStop(ctx)
+
+	currentCtxMu.Lock()
+	currentCtx = Context{}
+	currentCtxMu.Unlock()
+
+	rawCfgJSON = nil
+	rawCfgIndex = nil
+	rawCfg[rawConfigKey] = nil
+	rawCfgMu.Unlock()
+
+	return nil
+}
+
+// unsyncedStop stops ctx from running, but has
+// no locking around ctx. It is a no-op if ctx has a
+// nil cfg. If any app returns an error when stopping,
+// it is logged and the function continues stopping
+// the next app. This function assumes all apps in
+// ctx were successfully started first.
+//
+// A lock on rawCfgMu is required, even though this
+// function does not access rawCfg, that lock
+// synchronizes the stop/start of apps.
+func unsyncedStop(ctx Context) {
+	if ctx.cfg == nil {
+		return
+	}
+
+	// TODO: This event is experimental and subject to change.
+	ctx.emitEvent("stopping", nil)
+
+	// stop each app
+	for name, a := range ctx.cfg.apps {
+		err := a.Stop()
+		if err != nil {
+			log.Printf("[ERROR] stop %s: %v", name, err)
+		}
+	}
+
+	// clean up all modules
+	ctx.cfg.cancelFunc()
+}
+
+// Validate loads, provisions, and validates
+// cfg, but does not start running it.
+func Validate(cfg *Config) error {
+	_, err := run(cfg, false)
+	if err == nil {
+		cfg.cancelFunc() // call Cleanup on all modules
+	}
+	return err
+}
+
+// exitProcess exits the process as gracefully as possible,
+// but it always exits, even if there are errors doing so.
+// It stops all apps, cleans up external locks, removes any
+// PID file, and shuts down admin endpoint(s) in a goroutine.
+// Errors are logged along the way, and an appropriate exit
+// code is emitted.
+func exitProcess(ctx context.Context, logger *zap.Logger) {
+	// let the rest of the program know we're quitting; only do it once
+	if !atomic.CompareAndSwapInt32(exiting, 0, 1) {
+		return
+	}
+
+	// give the OS or service/process manager our 2 weeks' notice: we quit
+	if err := notify.Stopping(); err != nil {
+		Log().Error("unable to notify service manager of stopping state", zap.Error(err))
+	}
+
+	if logger == nil {
+		logger = Log()
+	}
+	logger.Warn("exiting; byeee!! 👋")
+
+	exitCode := ExitCodeSuccess
+	lastContext := ActiveContext()
+
+	// stop all apps
+	if err := Stop(); err != nil {
+		logger.Error("failed to stop apps", zap.Error(err))
+		exitCode = ExitCodeFailedQuit
+	}
+
+	// clean up certmagic locks
+	// certmagic.CleanUpOwnLocks(ctx, logger)
+
+	// remove pidfile
+	if pidfile != "" {
+		err := os.Remove(pidfile)
+		if err != nil {
+			logger.Error("cleaning up PID file:",
+				zap.String("pidfile", pidfile),
+				zap.Error(err))
+			exitCode = ExitCodeFailedQuit
+		}
+	}
+
+	// execute any process-exit callbacks
+	for _, exitFunc := range lastContext.exitFuncs {
+		exitFunc(ctx)
+	}
+	exitFuncsMu.Lock()
+	for _, exitFunc := range exitFuncs {
+		exitFunc(ctx)
+	}
+	exitFuncsMu.Unlock()
+
+	// shut down admin endpoint(s) in goroutines so that
+	// if this function was called from an admin handler,
+	// it has a chance to return gracefully
+	// use goroutine so that we can finish responding to API request
+	go func() {
+		defer func() {
+			logger = logger.With(zap.Int("exit_code", exitCode))
+			if exitCode == ExitCodeSuccess {
+				logger.Info("shutdown complete")
+			} else {
+				logger.Error("unclean shutdown")
+			}
+			os.Exit(exitCode)
+		}()
+	}()
+}
+
+var exiting = new(int32) // accessed atomically
+
+// Exiting returns true if the process is exiting.
+// EXPERIMENTAL API: subject to change or removal.
+func Exiting() bool { return atomic.LoadInt32(exiting) == 1 }
+
+// OnExit registers a callback to invoke during process exit.
+// This registration is PROCESS-GLOBAL, meaning that each
+// function should only be registered once forever, NOT once
+// per config load (etc).
+//
+// EXPERIMENTAL API: subject to change or removal.
+func OnExit(f func(context.Context)) {
+	exitFuncsMu.Lock()
+	exitFuncs = append(exitFuncs, f)
+	exitFuncsMu.Unlock()
+}
+
+var (
+	exitFuncs   []func(context.Context)
+	exitFuncsMu sync.Mutex
+)
+
+// Duration can be an integer or a string. An integer is
+// interpreted as nanoseconds. If a string, it is a Go
+// time.Duration value such as `300ms`, `1.5h`, or `2h45m`;
+// valid units are `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, and `d`.
+type Duration time.Duration
+
+// UnmarshalJSON satisfies json.Unmarshaler.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 {
+		return io.EOF
+	}
+	var dur time.Duration
+	var err error
+	if b[0] == byte('"') && b[len(b)-1] == byte('"') {
+		dur, err = ParseDuration(strings.Trim(string(b), `"`))
+	} else {
+		err = json.Unmarshal(b, &dur)
+	}
+	*d = Duration(dur)
+	return err
+}
+
+// ParseDuration parses a duration string, adding
+// support for the "d" unit meaning number of days,
+// where a day is assumed to be 24h. The maximum
+// input string length is 1024.
+func ParseDuration(s string) (time.Duration, error) {
+	if len(s) > 1024 {
+		return 0, fmt.Errorf("parsing duration: input string too long")
+	}
+	var inNumber bool
+	var numStart int
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == 'd' {
+			daysStr := s[numStart:i]
+			days, err := strconv.ParseFloat(daysStr, 64)
+			if err != nil {
+				return 0, err
+			}
+			hours := days * 24.0
+			hoursStr := strconv.FormatFloat(hours, 'f', -1, 64)
+			s = s[:numStart] + hoursStr + "h" + s[i+1:]
+			i--
+			continue
+		}
+		if !inNumber {
+			numStart = i
+		}
+		inNumber = (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '+'
+	}
+	return time.ParseDuration(s)
+}
+
+// InstanceID returns the UUID for this instance, and generates one if it
+// does not already exist. The UUID is stored in the local data directory,
+// regardless of storage configuration, since each instance is intended to
+// have its own unique ID.
+func InstanceID() (uuid.UUID, error) {
+	appDataDir := AppDataDir()
+	uuidFilePath := filepath.Join(appDataDir, "instance.uuid")
+	uuidFileBytes, err := os.ReadFile(uuidFilePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		uuid, err := uuid.NewRandom()
+		if err != nil {
+			return uuid, err
+		}
+		err = os.MkdirAll(appDataDir, 0o700)
+		if err != nil {
+			return uuid, err
+		}
+		err = os.WriteFile(uuidFilePath, []byte(uuid.String()), 0o600)
+		return uuid, err
+	} else if err != nil {
+		return [16]byte{}, err
+	}
+	return uuid.ParseBytes(uuidFileBytes)
+}
+
+// CustomVersion is an optional string that overrides Caddy's
+// reported version. It can be helpful when downstream packagers
+// need to manually set Caddy's version. If no other version
+// information is available, the short form version (see
+// Version()) will be set to CustomVersion, and the full version
+// will include CustomVersion at the beginning.
+//
+// Set this variable during `go build` with `-ldflags`:
+//
+//	-ldflags '-X github.com/caddyserver/caddy/v2.CustomVersion=v2.6.2'
+//
+// for example.
+var CustomVersion string
+
+// CustomBinaryName is an optional string that overrides the root
+// command name from the default of "caddy". This is useful for
+// downstream projects that embed Caddy but use a different binary
+// name. Shell completions and help text will use this name instead
+// of "caddy".
+//
+// Set this variable during `go build` with `-ldflags`:
+//
+//	-ldflags '-X github.com/caddyserver/caddy/v2.CustomBinaryName=my_custom_caddy'
+//
+// for example.
+var CustomBinaryName string
+
+// CustomLongDescription is an optional string that overrides the
+// long description of the root Cobra command. This is useful for
+// downstream projects that embed Caddy but want different help
+// output.
+//
+// Set this variable in an init() function of a package that is
+// imported by your main:
+//
+//	func init() {
+//	    caddy.CustomLongDescription = "My custom server based on Caddy..."
+//	}
+//
+// for example.
+var CustomLongDescription string
+
+// Version returns the Caddy version in a simple/short form, and
+// a full version string. The short form will not have spaces and
+// is intended for User-Agent strings and similar, but may be
+// omitting valuable information. Note that Caddy must be compiled
+// in a special way to properly embed complete version information.
+// First this function tries to get the version from the embedded
+// build info provided by go.mod dependencies; then it tries to
+// get info from embedded VCS information, which requires having
+// built Caddy from a git repository. If no version is available,
+// this function returns "(devel)" because Go uses that, but for
+// the simple form we change it to "unknown". If still no version
+// is available (e.g. no VCS repo), then it will use CustomVersion;
+// CustomVersion is always prepended to the full version string.
+//
+// See relevant Go issues: https://github.com/golang/go/issues/29228
+// and https://github.com/golang/go/issues/50603.
+//
+// This function is experimental and subject to change or removal.
+func Version() (simple, full string) {
+	// the currently-recommended way to build Caddy involves
+	// building it as a dependency so we can extract version
+	// information from go.mod tooling; once the upstream
+	// Go issues are fixed, we should just be able to use
+	// bi.Main... hopefully.
+	var module *debug.Module
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		if CustomVersion != "" {
+			full = CustomVersion
+			simple = CustomVersion
+			return simple, full
+		}
+		full = "unknown"
+		simple = "unknown"
+		return simple, full
+	}
+	// find the Caddy module in the dependency list
+	for _, dep := range bi.Deps {
+		if dep.Path == ImportPath {
+			module = dep
+			break
+		}
+	}
+	if module != nil {
+		simple, full = module.Version, module.Version
+		if module.Sum != "" {
+			full += " " + module.Sum
+		}
+		if module.Replace != nil {
+			full += " => " + module.Replace.Path
+			if module.Replace.Version != "" {
+				simple = module.Replace.Version + "_custom"
+				full += "@" + module.Replace.Version
+			}
+			if module.Replace.Sum != "" {
+				full += " " + module.Replace.Sum
+			}
+		}
+	}
+
+	if full == "" {
+		var vcsRevision string
+		var vcsTime time.Time
+		var vcsModified bool
+		for _, setting := range bi.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				vcsRevision = setting.Value
+			case "vcs.time":
+				vcsTime, _ = time.Parse(time.RFC3339, setting.Value)
+			case "vcs.modified":
+				vcsModified, _ = strconv.ParseBool(setting.Value)
+			}
+		}
+
+		if vcsRevision != "" {
+			var modified string
+			if vcsModified {
+				modified = "+modified"
+			}
+			full = fmt.Sprintf("%s%s (%s)", vcsRevision, modified, vcsTime.Format(time.RFC822))
+			simple = vcsRevision
+
+			// use short checksum for simple, if hex-only
+			if _, err := hex.DecodeString(simple); err == nil {
+				simple = simple[:8]
+			}
+
+			// append date to simple since it can be convenient
+			// to know the commit date as part of the version
+			if !vcsTime.IsZero() {
+				simple += "-" + vcsTime.Format("20060102")
+			}
+		}
+	}
+
+	if full == "" {
+		if CustomVersion != "" {
+			full = CustomVersion
+		} else {
+			full = "unknown"
+		}
+	} else if CustomVersion != "" {
+		full = CustomVersion + " " + full
+	}
+
+	if simple == "" || simple == "(devel)" {
+		if CustomVersion != "" {
+			simple = CustomVersion
+		} else {
+			simple = "unknown"
+		}
+	}
+
+	return simple, full
+}
+
+// Event represents something that has happened or is happening.
+// An Event value is not synchronized, so it should be copied if
+// being used in goroutines.
+//
+// EXPERIMENTAL: Events are subject to change.
+type Event struct {
+	// If non-nil, the event has been aborted, meaning
+	// propagation has stopped to other handlers and
+	// the code should stop what it was doing. Emitters
+	// may choose to use this as a signal to adjust their
+	// code path appropriately.
+	Aborted error
+
+	// The data associated with the event. Usually the
+	// original emitter will be the only one to set or
+	// change these values, but the field is exported
+	// so handlers can have full access if needed.
+	// However, this map is not synchronized, so
+	// handlers must not use this map directly in new
+	// goroutines; instead, copy the map to use it in a
+	// goroutine. Data may be nil.
+	Data map[string]any
+
+	id     uuid.UUID
+	ts     time.Time
+	name   string
+	origin Module
+}
+
+// NewEvent creates a new event, but does not emit the event. To emit an
+// event, call Emit() on the current instance of the caddyevents app instead.
+//
+// EXPERIMENTAL: Subject to change.
+func NewEvent(ctx Context, name string, data map[string]any) (Event, error) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return Event{}, fmt.Errorf("generating new event ID: %v", err)
+	}
+	name = strings.ToLower(name)
+	return Event{
+		Data:   data,
+		id:     id,
+		ts:     time.Now(),
+		name:   name,
+		origin: ctx.Module(),
+	}, nil
+}
+
+func (e Event) ID() uuid.UUID        { return e.id }
+func (e Event) Timestamp() time.Time { return e.ts }
+func (e Event) Name() string         { return e.name }
+func (e Event) Origin() Module       { return e.origin } // Returns the module that originated the event. May be nil, usually if caddy core emits the event.
+
+// CloudEvent exports event e as a structure that, when
+// serialized as JSON, is compatible with the
+// CloudEvents spec.
+func (e Event) CloudEvent() CloudEvent {
+	dataJSON, _ := json.Marshal(e.Data)
+	var source string
+	if e.Origin() == nil {
+		source = "caddy"
+	} else {
+		source = string(e.Origin().NotidrawerModule().ID)
+	}
+	return CloudEvent{
+		ID:              e.id.String(),
+		Source:          source,
+		SpecVersion:     "1.0",
+		Type:            e.name,
+		Time:            e.ts,
+		DataContentType: "application/json",
+		Data:            dataJSON,
+	}
+}
+
+// CloudEvent is a JSON-serializable structure that
+// is compatible with the CloudEvents specification.
+// See https://cloudevents.io.
+// EXPERIMENTAL: Subject to change.
+type CloudEvent struct {
+	ID              string          `json:"id"`
+	Source          string          `json:"source"`
+	SpecVersion     string          `json:"specversion"`
+	Type            string          `json:"type"`
+	Time            time.Time       `json:"time"`
+	DataContentType string          `json:"datacontenttype,omitempty"`
+	Data            json.RawMessage `json:"data,omitempty"`
+}
+
+// ErrEventAborted cancels an event.
+var ErrEventAborted = errors.New("event aborted")
+
+// ActiveContext returns the currently-active context.
+// This function is experimental and might be changed
+// or removed in the future.
+func ActiveContext() Context {
+	currentCtxMu.RLock()
+	defer currentCtxMu.RUnlock()
+	return currentCtx
+}
+
+// CtxKey is a value type for use with context.WithValue.
+type CtxKey string
+
+// This group of variables pertains to the current configuration.
+var (
+	// currentCtx is the root context for the currently-running
+	// configuration, which can be accessed through this value.
+	// If the Config contained in this value is not nil, then
+	// a config is currently active/running.
+	currentCtx   Context
+	currentCtxMu sync.RWMutex
+
+	// rawCfg is the current, generic-decoded configuration;
+	// we initialize it as a map with one field ("config")
+	// to maintain parity with the API endpoint and to avoid
+	// the special case of having to access/mutate the variable
+	// directly without traversing into it.
+	rawCfg = map[string]any{
+		rawConfigKey: nil,
+	}
+
+	// rawCfgJSON is the JSON-encoded form of rawCfg. Keeping
+	// this around avoids an extra Marshal call during changes.
+	rawCfgJSON []byte
+
+	// rawCfgIndex is the map of user-assigned ID to expanded
+	// path, for converting /id/ paths to /config/ paths.
+	rawCfgIndex map[string]string
+
+	// rawCfgMu protects all the rawCfg fields and also
+	// essentially synchronizes config changes/reloads.
+	rawCfgMu sync.RWMutex
+)
+
+// lastConfigFile and lastConfigAdapter remember the source config
+// file and adapter used when Caddy was started via the CLI "run" command.
+// These are consulted by the SIGUSR1 handler to attempt reloading from
+// the same source. They are intentionally not set for other entrypoints
+// such as "caddy start" or subcommands like file-server.
+var (
+	lastConfigMu      sync.RWMutex
+	lastConfigFile    string
+	lastConfigAdapter string
+)
+
+// reloadFromSourceFunc is the type of stored callback
+// which is called when we receive a SIGUSR1 signal.
+type reloadFromSourceFunc func(file, adapter string) error
+
+// reloadFromSourceCallback is the stored callback
+// which is called when we receive a SIGUSR1 signal.
+var reloadFromSourceCallback reloadFromSourceFunc
+
+// errReloadFromSourceUnavailable is returned when no reload-from-source callback is set.
+var errReloadFromSourceUnavailable = errors.New("reload from source unavailable in this process") //nolint:unused
+
+// SetLastConfig records the given source file and adapter as the
+// last-known external configuration source. Intended to be called
+// only when starting via "caddy run --config <file> --adapter <adapter>".
+func SetLastConfig(file, adapter string, fn reloadFromSourceFunc) {
+	lastConfigMu.Lock()
+	lastConfigFile = file
+	lastConfigAdapter = adapter
+	reloadFromSourceCallback = fn
+	lastConfigMu.Unlock()
+}
+
+// ClearLastConfigIfDifferent clears the recorded last-config if the provided
+// source file/adapter do not match the recorded last-config. If both srcFile
+// and srcAdapter are empty, the last-config is cleared.
+func ClearLastConfigIfDifferent(srcFile, srcAdapter string) {
+	if (srcFile != "" || srcAdapter != "") && lastConfigMatches(srcFile, srcAdapter) {
+		return
+	}
+	SetLastConfig("", "", nil)
+}
+
+// getLastConfig returns the last-known config file and adapter.
+func getLastConfig() (file, adapter string, fn reloadFromSourceFunc) {
+	lastConfigMu.RLock()
+	f, a, cb := lastConfigFile, lastConfigAdapter, reloadFromSourceCallback
+	lastConfigMu.RUnlock()
+	return f, a, cb
+}
+
+// lastConfigMatches returns true if the provided source file and/or adapter
+// matches the recorded last-config. Matching rules (in priority order):
+// 1. If srcAdapter is provided and differs from the recorded adapter, no match.
+// 2. If srcFile exactly equals the recorded file, match.
+// 3. If both sides can be made absolute and equal, match.
+// 4. If basenames are equal, match.
+func lastConfigMatches(srcFile, srcAdapter string) bool {
+	lf, la, _ := getLastConfig()
+
+	// If adapter is provided, it must match.
+	if srcAdapter != "" && srcAdapter != la {
+		return false
+	}
+
+	// Quick equality check.
+	if srcFile == lf {
+		return true
+	}
+
+	// Try absolute path comparison.
+	sAbs, sErr := filepath.Abs(srcFile)
+	lAbs, lErr := filepath.Abs(lf)
+	if sErr == nil && lErr == nil && sAbs == lAbs {
+		return true
+	}
+
+	// Final fallback: basename equality.
+	if filepath.Base(srcFile) == filepath.Base(lf) {
+		return true
+	}
+
+	return false
+}
+
+// errSameConfig is returned if the new config is the same
+// as the old one. This isn't usually an actual, actionable
+// error; it's mostly a sentinel value.
+var errSameConfig = errors.New("config is unchanged")
+
+// ImportPath is the package import path for Caddy core.
+// This identifier may be removed in the future.
+const ImportPath = "github.com/divaxi/noti-drawer"
