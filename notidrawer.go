@@ -278,20 +278,6 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 		return err
 	}
 
-	// prevent recursive config loads; that is a user error, and
-	// although frequent config loads should be safe, we cannot
-	// guarantee that in the presence of third party plugins, nor
-	// do we want this error to go unnoticed (we assume it was a
-	// pulled config if we're not allowed to persist it)
-	if !allowPersist &&
-		newCfg != nil &&
-		newCfg.Admin != nil &&
-		newCfg.Admin.Config != nil &&
-		newCfg.Admin.Config.LoadRaw != nil &&
-		newCfg.Admin.Config.LoadDelay <= 0 {
-		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
-	}
-
 	// run the new config and start all its apps
 	ctx, err := run(newCfg, true)
 	if err != nil {
@@ -306,31 +292,6 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCtx)
-
-	// autosave a non-nil config, if not disabled
-	if allowPersist &&
-		newCfg != nil &&
-		(newCfg.Admin == nil ||
-			newCfg.Admin.Config == nil ||
-			newCfg.Admin.Config.Persist == nil ||
-			*newCfg.Admin.Config.Persist) {
-		dir := filepath.Dir(ConfigAutosavePath)
-		err := os.MkdirAll(dir, 0o700)
-		if err != nil {
-			Log().Error("unable to create folder for config autosave",
-				zap.String("dir", dir),
-				zap.Error(err))
-		} else {
-			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
-			if err == nil {
-				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
-			} else {
-				Log().Error("unable to autosave config",
-					zap.String("file", ConfigAutosavePath),
-					zap.Error(err))
-			}
-		}
-	}
 
 	return nil
 }
@@ -405,7 +366,8 @@ func run(newCfg *Config, start bool) (Context, error) {
 
 	// now that the user's config is running, finish setting up anything else,
 	// such as remote admin endpoint, config loader, etc.
-	err = finishSettingUp(ctx, ctx.cfg)
+	// err = finishSettingUp(ctx, ctx.cfg)
+
 	return ctx, err
 }
 
@@ -506,51 +468,55 @@ func provisionContext(newCfg *Config) (Context, error) {
 	return ctx, err
 }
 
+// Does not need dynamic config loading or remote management, so we can just run it
+
 // finishSettingUp should be run after all apps have successfully started.
-func finishSettingUp(ctx Context, cfg *Config) error {
-	// establish this server's identity (only after apps are loaded
-	// so that cert management of this endpoint doesn't prevent user's
-	// servers from starting which likely also use HTTP/HTTPS ports;
-	// but before remote management which may depend on these creds)
+// func finishSettingUp(ctx Context, cfg *Config) error {
+// 	// establish this server's identity (only after apps are loaded
+// 	// so that cert management of this endpoint doesn't prevent user's
+// 	// servers from starting which likely also use HTTP/HTTPS ports;
+// 	// but before remote management which may depend on these creds)
 
-	// if dynamic config is requested, set that up and run it
-	if cfg != nil {
-		val, err := ctx.LoadModule(cfg, "LoadRaw")
-		if err != nil {
-			return fmt.Errorf("loading config loader module: %s", err)
-		}
+// 	// if dynamic config is requested, set that up and run it
+// 	if cfg != nil {
+// 		val, err := ctx.LoadModule(cfg, "LoadRaw")
+// 		if err != nil {
+// 			return fmt.Errorf("loading config loader module: %s", err)
+// 		}
 
-		logger := Log().Named("config_loader").With(
-			zap.String("module", val.(Module).NotidrawerModule().ID.Name()),
-		)
-		runLoadedConfig := func(config []byte) error {
-			logger.Info("applying dynamically-loaded config")
-			if err != nil {
-				logger.Error("failed to run dynamically-loaded config", zap.Error(err))
-				return err
-			}
-			logger.Info("successfully applied dynamically-loaded config")
-			return nil
-		}
+// 		logger := Log().Named("config_loader").With(
+// 			zap.String("module", val.(Module).NotidrawerModule().ID.Name()),
+// 		)
+// 		runLoadedConfig := func(config []byte) error {
+// 			logger.Info("applying dynamically-loaded config")
+// 			err := changeConfig(config, false)
+// 			if err != nil {
+// 				logger.Error("failed to run dynamically-loaded config", zap.Error(err))
+// 				return err
+// 			}
+// 			logger.Info("successfully applied dynamically-loaded config")
+// 			return nil
+// 		}
 
-		// if no LoadDelay is provided, will load config synchronously
-		loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
-		if err != nil {
-			return fmt.Errorf("loading dynamic config from %T: %v", val, err)
-		}
-		// do this in a goroutine so current config can finish being loaded; otherwise deadlock
-		go func() { _ = runLoadedConfig(loadedConfig) }()
-	}
-	return nil
-}
+// 		// if no LoadDelay is provided, will load config synchronously
+// 		loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
+// 		if err != nil {
+// 			return fmt.Errorf("loading dynamic config from %T: %v", val, err)
+// 		}
+// 		// do this in a goroutine so current config can finish being loaded; otherwise deadlock
+// 		go func() { _ = runLoadedConfig(loadedConfig) }()
+// 	}
+// 	return nil
+// }
 
 // ConfigLoader is a type that can load a Caddy config. If
 // the return value is non-nil, it must be valid Caddy JSON;
 // if nil or with non-nil error, it is considered to be a
 // no-op load and may be retried later.
-type ConfigLoader interface {
-	LoadConfig(Context) ([]byte, error)
-}
+
+// type ConfigLoader interface {
+// 	LoadConfig(Context) ([]byte, error)
+// }
 
 // Stop stops running the current configuration.
 // It is the antithesis of Run(). This function
