@@ -1,6 +1,7 @@
 package notidrawer
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -62,12 +64,12 @@ type Config struct {
 	// module is `caddy.storage.file_system` (the local file system),
 	// and the default path
 	// [depends on the OS and environment](/docs/conventions#data-directory).
-	StorageRaw json.RawMessage `json:"storage,omitempty" caddy:"namespace=caddy.storage inline_key=module"`
+	StorageRaw json.RawMessage `json:"storage,omitempty" caddy:"namespace=notidrawer.storage inline_key=module"`
 
 	// AppsRaw are the apps that Caddy will load and run. The
 	// app module name is the key, and the app's config is the
 	// associated value.
-	AppsRaw ModuleMap `json:"apps,omitempty" caddy:"namespace="`
+	AppsRaw ModuleMap `json:"apps,omitempty" notidrawer:"namespace="`
 
 	apps map[string]App
 
@@ -95,13 +97,13 @@ func Run(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return Load(cfgJSON)
+	return Load(cfgJSON, true)
 }
 
 // Load loads the given config JSON and runs it only
 // if it is different from the current config or
 // forceReload is true.
-func Load(cfgJSON []byte) error {
+func Load(cfgJSON []byte, forceReload bool) error {
 	if err := notify.Reloading(); err != nil {
 		Log().Error("unable to notify service manager of reloading state", zap.Error(err))
 	}
@@ -125,6 +127,8 @@ func Load(cfgJSON []byte) error {
 
 	// Need to implement the load config and Run apps here
 
+	err = changeConfig(cfgJSON, forceReload)
+
 	if errors.Is(err, errSameConfig) {
 		err = nil // not really an error
 	}
@@ -132,11 +136,202 @@ func Load(cfgJSON []byte) error {
 	return err
 }
 
+// changeConfig changes the current config (rawCfg) uses the
+// given input as the new value. If the resulting config is the same as
+// the previous, no reload will
+// occur unless forceReload is true. If the config is unchanged and not
+// forcefully reloaded, then errConfigUnchanged is returned. This function
+// is safe for concurrent use.
+func changeConfig(input []byte, forceReload bool) error {
+	rawCfgMu.Lock()
+	defer rawCfgMu.Unlock()
+
+	err := unsyncedConfigAccess(input, nil)
+
+	if err != nil {
+		return err
+	}
+
+	// the mutation is complete, so encode the entire config as JSON
+	newCfg, err := json.Marshal(rawCfg[rawConfigKey])
+	if err != nil {
+		// This should send error directly to notify daemon (e.g. dunst),
+		// cause this error relate to user configuration,
+		// so we should notify user as soon as possible. And this error is
+		// not related to the previous config, so we don't need to set notify error here.
+		return DaemonError{
+			Phase: PhaseStarting,
+			Err:   fmt.Errorf(("endcoding new config: %v"), err),
+		}
+	}
+
+	// if nothing changed and not forceReload, then we can skip the reload
+	if !forceReload && bytes.Equal(rawCfgJSON, newCfg) {
+		Log().Info("config unchanged; not reloading")
+		return errSameConfig
+	}
+
+	//find any IDs in this config and index them
+	idx := make(map[string]string)
+	err = indexConfigObjects(rawCfg[rawConfigKey], "/"+rawConfigKey, idx)
+	if err != nil {
+		return DaemonError{
+			Phase: PhaseIndexing,
+			Err:   fmt.Errorf(("indexing config: %v"), err),
+		}
+	}
+
+	// load this new config; if it fails, we need to revert to
+	// our old representation of actual config
+
+	err = unsyncedDecodeAndRun(newCfg, true)
+	if err != nil {
+		if len(rawCfgJSON) > 0 {
+			// restore old config state to keep it consistent
+			// with what caddy is still running; we need to
+			// unmarshal it again because it's likely that
+			// pointers deep in our rawCfg map were modified
+			var oldCfg any
+			err2 := json.Unmarshal(rawCfgJSON, &oldCfg)
+			if err2 != nil {
+				err = fmt.Errorf("%v; additionally, restoring old config: %v", err, err2)
+			}
+			rawCfg[rawConfigKey] = oldCfg
+		}
+
+		return fmt.Errorf("loading new config: %v", err)
+
+	}
+
+	// success, so update our stored copy of the encoded
+	// config to keep it consistent with what caddy is now
+	// running (storing an encoded copy is not strictly
+	// necessary, but avoids an extra json.Marshal for
+	// each config change)
+	rawCfgJSON = newCfg
+	rawCfgIndex = idx
+
+	return nil
+}
+
 // readConfig traverses the current config to path
 // and writes its JSON encoding to out.
 func readConfig(path string, out io.Writer) error {
 	rawCfgMu.RLock()
 	defer rawCfgMu.RUnlock()
+	return nil
+}
+
+// indexConfigObjects recursively searches ptr for object fields named
+// "@id" and maps that ID value to the full configPath in the index.
+// This function is NOT safe for concurrent access; obtain a write lock
+// on currentCtxMu.
+func indexConfigObjects(ptr any, configPath string, index map[string]string) error {
+	switch val := ptr.(type) {
+	case map[string]any:
+		for k, v := range val {
+			if k == idKey {
+				switch idVal := v.(type) {
+				case string:
+					index[idVal] = configPath
+				case float64: // all JSON numbers decode as float64
+					index[fmt.Sprintf("%v", idVal)] = configPath
+				default:
+					return fmt.Errorf("%s: %s field must be a string or number", configPath, idKey)
+				}
+				continue
+			}
+			// traverse this object property recursively
+			err := indexConfigObjects(val[k], path.Join(configPath, k), index)
+			if err != nil {
+				return err
+			}
+		}
+	case []any:
+		// traverse each element of the array recursively
+		for i := range val {
+			err := indexConfigObjects(val[i], path.Join(configPath, strconv.Itoa(i)), index)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// from cfgJSON, decodes the result into a *Config, and runs
+// it as the new config, replacing any other current config.
+// It does NOT update the raw config state, as this is a
+// lower-level function; most callers will want to use Load
+// instead. A write lock on rawCfgMu is required! If
+// allowPersist is false, it will not be persisted to disk,
+// even if it is configured to.
+func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
+	// remove any @id fields from the JSON, which would cause
+	// loading to break since the field wouldn't be recognized
+	strippedCfgJSON := RemoveMetaFields(cfgJSON)
+
+	var newCfg *Config
+	err := StrictUnmarshalJSON(strippedCfgJSON, &newCfg)
+	if err != nil {
+		return err
+	}
+
+	// prevent recursive config loads; that is a user error, and
+	// although frequent config loads should be safe, we cannot
+	// guarantee that in the presence of third party plugins, nor
+	// do we want this error to go unnoticed (we assume it was a
+	// pulled config if we're not allowed to persist it)
+	if !allowPersist &&
+		newCfg != nil &&
+		newCfg.Admin != nil &&
+		newCfg.Admin.Config != nil &&
+		newCfg.Admin.Config.LoadRaw != nil &&
+		newCfg.Admin.Config.LoadDelay <= 0 {
+		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
+	}
+
+	// run the new config and start all its apps
+	ctx, err := run(newCfg, true)
+	if err != nil {
+		return err
+	}
+
+	// swap old context (including its config) with the new one
+	currentCtxMu.Lock()
+	oldCtx := currentCtx
+	currentCtx = ctx
+	currentCtxMu.Unlock()
+
+	// Stop, Cleanup each old app
+	unsyncedStop(oldCtx)
+
+	// autosave a non-nil config, if not disabled
+	if allowPersist &&
+		newCfg != nil &&
+		(newCfg.Admin == nil ||
+			newCfg.Admin.Config == nil ||
+			newCfg.Admin.Config.Persist == nil ||
+			*newCfg.Admin.Config.Persist) {
+		dir := filepath.Dir(ConfigAutosavePath)
+		err := os.MkdirAll(dir, 0o700)
+		if err != nil {
+			Log().Error("unable to create folder for config autosave",
+				zap.String("dir", dir),
+				zap.Error(err))
+		} else {
+			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
+			if err == nil {
+				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
+			} else {
+				Log().Error("unable to autosave config",
+					zap.String("file", ConfigAutosavePath),
+					zap.Error(err))
+			}
+		}
+	}
+
 	return nil
 }
 
